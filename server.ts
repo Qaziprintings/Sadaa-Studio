@@ -183,6 +183,104 @@ async function generateSingleTtsWithFallback(
   }
 }
 
+const FALLBACK_BOOT_SECRET = crypto.randomBytes(32).toString("hex");
+const SESSION_COOKIE_NAME = "sada_session";
+const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const loginAttempts = new Map<string, { count: number; resetAt: number }>();
+
+function getConfiguredAccessCode(): string {
+  return (process.env.STUDIO_ACCESS_CODE || process.env.ACCESS_CODE || "").trim();
+}
+
+function getSigningSecret(): string {
+  if (process.env.SESSION_SECRET) return process.env.SESSION_SECRET;
+  const code = getConfiguredAccessCode();
+  const key = process.env.GEMINI_API_KEY || "";
+  if (code || key) {
+    return crypto.createHash("sha256").update(`sada-session:${code}:${key}`).digest("hex");
+  }
+  return FALLBACK_BOOT_SECRET;
+}
+
+function verifySecretCode(input: string, expected: string): boolean {
+  const inputHash = crypto.createHash("sha256").update(input).digest();
+  const expectedHash = crypto.createHash("sha256").update(expected).digest();
+  return crypto.timingSafeEqual(inputHash, expectedHash);
+}
+
+function createSessionToken(): string {
+  const payload = Buffer.from(
+    JSON.stringify({ iat: Date.now(), exp: Date.now() + SESSION_TTL_MS }),
+    "utf8"
+  ).toString("base64url");
+  const sig = crypto.createHmac("sha256", getSigningSecret()).update(payload).digest("base64url");
+  return `${payload}.${sig}`;
+}
+
+function verifySessionToken(token: string | undefined | null): boolean {
+  if (!token || !getConfiguredAccessCode()) return false;
+  const parts = token.split(".");
+  if (parts.length !== 2) return false;
+  const [payloadB64, sigB64] = parts;
+  if (!payloadB64 || !sigB64) return false;
+
+  const expectedSig = crypto
+    .createHmac("sha256", getSigningSecret())
+    .update(payloadB64)
+    .digest("base64url");
+
+  const sigBuf = Buffer.from(sigB64, "utf8");
+  const expectedBuf = Buffer.from(expectedSig, "utf8");
+  if (sigBuf.length !== expectedBuf.length || !crypto.timingSafeEqual(sigBuf, expectedBuf)) {
+    return false;
+  }
+
+  try {
+    const parsed = JSON.parse(Buffer.from(payloadB64, "base64url").toString("utf8")) as {
+      exp?: number;
+    };
+    return typeof parsed.exp === "number" && parsed.exp > Date.now();
+  } catch {
+    return false;
+  }
+}
+
+function parseCookies(cookieHeader: string | undefined): Record<string, string> {
+  if (!cookieHeader) return {};
+  const result: Record<string, string> = {};
+  for (const part of cookieHeader.split(";")) {
+    const eqIndex = part.indexOf("=");
+    if (eqIndex > 0) {
+      const name = part.slice(0, eqIndex).trim();
+      const value = part.slice(eqIndex + 1).trim();
+      result[name] = decodeURIComponent(value);
+    }
+  }
+  return result;
+}
+
+function extractSessionToken(req: express.Request): string | null {
+  const authHeader = req.headers.authorization;
+  if (authHeader && authHeader.startsWith("Bearer ")) {
+    return authHeader.slice(7).trim();
+  }
+  const cookies = parseCookies(req.headers.cookie);
+  return cookies[SESSION_COOKIE_NAME] || null;
+}
+
+function requireAuth(
+  req: express.Request,
+  res: express.Response,
+  next: express.NextFunction
+) {
+  const token = extractSessionToken(req);
+  if (!verifySessionToken(token)) {
+    res.status(401).json({ error: "Studio access required. Please enter your secret code." });
+    return;
+  }
+  next();
+}
+
 async function startServer() {
   const app = express();
   app.use(express.json({ limit: "2mb" }));
@@ -190,6 +288,67 @@ async function startServer() {
   app.get("/api/health", (_req, res) => {
     res.json({ ok: true });
   });
+
+  app.get("/api/auth/status", (req, res) => {
+    const configured = getConfiguredAccessCode().length > 0;
+    const token = extractSessionToken(req);
+    const authenticated = configured && verifySessionToken(token);
+    res.json({ configured, authenticated });
+  });
+
+  app.post("/api/auth/login", (req, res) => {
+    const expectedCode = getConfiguredAccessCode();
+    if (!expectedCode) {
+      res.status(503).json({
+        error: "Access code is not configured. Add STUDIO_ACCESS_CODE in Settings > Secrets.",
+      });
+      return;
+    }
+
+    const clientIp = req.ip || req.socket.remoteAddress || "unknown";
+    const now = Date.now();
+    const record = loginAttempts.get(clientIp);
+    if (record && now < record.resetAt && record.count >= 10) {
+      res.status(429).json({ error: "Too many failed attempts. Please wait a few minutes and try again." });
+      return;
+    }
+
+    const { code } = req.body as { code?: string };
+    if (!code || typeof code !== "string" || !verifySecretCode(code.trim(), expectedCode)) {
+      const nextCount = record && now < record.resetAt ? record.count + 1 : 1;
+      loginAttempts.set(clientIp, {
+        count: nextCount,
+        resetAt: record && now < record.resetAt ? record.resetAt : now + 5 * 60 * 1000,
+      });
+      res.status(401).json({ error: "Incorrect access code. Please check your code and try again." });
+      return;
+    }
+
+    loginAttempts.delete(clientIp);
+    const token = createSessionToken();
+    const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https";
+    res.cookie(SESSION_COOKIE_NAME, token, {
+      httpOnly: true,
+      sameSite: isHttps ? "none" : "lax",
+      secure: isHttps,
+      maxAge: SESSION_TTL_MS,
+      path: "/",
+    });
+    res.json({ authenticated: true, token });
+  });
+
+  app.post("/api/auth/logout", (req, res) => {
+    const isHttps = req.secure || req.headers["x-forwarded-proto"] === "https";
+    res.clearCookie(SESSION_COOKIE_NAME, {
+      httpOnly: true,
+      sameSite: isHttps ? "none" : "lax",
+      secure: isHttps,
+      path: "/",
+    });
+    res.json({ authenticated: false });
+  });
+
+  app.use("/api/urdu", requireAuth);
 
   app.post("/api/urdu/prepare-script", async (req, res) => {
     try {

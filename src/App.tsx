@@ -4,6 +4,7 @@ import {
   BookOpen,
   Languages,
   Loader2,
+  LogOut,
   Mic,
   Plus,
   Trash2,
@@ -20,6 +21,9 @@ import { analyzeWavBuffer, createWavBlobUrl } from "./utils/audio";
 import { StudioTake, WaveformPlayer } from "./components/WaveformPlayer";
 import { VoiceCastPanel } from "./components/VoiceCastPanel";
 import { TakesHistory } from "./components/TakesHistory";
+import { AccessGate } from "./components/AccessGate";
+
+const TOKEN_STORAGE_KEY = "sadastudio_access_token";
 
 interface DialogueTurn {
   id: string;
@@ -28,6 +32,16 @@ interface DialogueTurn {
 }
 
 export default function App() {
+  const [authStatus, setAuthStatus] = useState<"checking" | "locked" | "unlocked">("checking");
+  const [accessConfigured, setAccessConfigured] = useState(true);
+  const [authToken, setAuthToken] = useState<string | null>(() => {
+    try {
+      return localStorage.getItem(TOKEN_STORAGE_KEY);
+    } catch {
+      return null;
+    }
+  });
+
   const [mode, setMode] = useState<"single" | "dialogue">("single");
   const [textDir, setTextDir] = useState<"rtl" | "auto">("rtl");
 
@@ -66,10 +80,77 @@ export default function App() {
   const [activeTake, setActiveTake] = useState<StudioTake | null>(null);
 
   useEffect(() => {
+    let active = true;
+    const verifySession = async () => {
+      try {
+        const headers: Record<string, string> = {};
+        if (authToken) {
+          headers["Authorization"] = `Bearer ${authToken}`;
+        }
+        const res = await fetch("/api/auth/status", { headers });
+        const data = await res.json();
+        if (!active) return;
+        setAccessConfigured(Boolean(data.configured));
+        if (data.authenticated) {
+          setAuthStatus("unlocked");
+        } else {
+          try {
+            localStorage.removeItem(TOKEN_STORAGE_KEY);
+          } catch {
+            // ignore
+          }
+          setAuthToken(null);
+          setAuthStatus("locked");
+        }
+      } catch {
+        if (active) setAuthStatus("locked");
+      }
+    };
+    verifySession();
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  useEffect(() => {
     return () => {
       previewUrlCacheRef.current.forEach((url) => URL.revokeObjectURL(url));
     };
   }, []);
+
+  const authHeaders = (): Record<string, string> => {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (authToken) {
+      headers["Authorization"] = `Bearer ${authToken}`;
+    }
+    return headers;
+  };
+
+  const handleAuthenticated = (token: string) => {
+    try {
+      localStorage.setItem(TOKEN_STORAGE_KEY, token);
+    } catch {
+      // ignore
+    }
+    setAuthToken(token);
+    setAuthStatus("unlocked");
+    setErrorMsg(null);
+  };
+
+  const handleSignOut = async () => {
+    try {
+      await fetch("/api/auth/logout", { method: "POST" });
+    } catch {
+      // ignore
+    }
+    try {
+      localStorage.removeItem(TOKEN_STORAGE_KEY);
+    } catch {
+      // ignore
+    }
+    setAuthToken(null);
+    setAuthStatus("locked");
+  };
 
   const wordCount =
     mode === "single"
@@ -113,13 +194,17 @@ export default function App() {
     try {
       const response = await fetch("/api/urdu/prepare-script", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(),
         body: JSON.stringify({
           text: script,
           action,
           tone: customStyle,
         }),
       });
+      if (response.status === 401) {
+        await handleSignOut();
+        return;
+      }
       const data = await response.json();
       if (!response.ok) {
         throw new Error(data.error || "Could not prepare Urdu script.");
@@ -179,13 +264,17 @@ export default function App() {
     try {
       const response = await fetch("/api/urdu/preview-voice", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(),
         body: JSON.stringify({
           voiceName: voice,
           text: profile?.previewText,
           style: profile?.defaultStyle,
         }),
       });
+      if (response.status === 401) {
+        await handleSignOut();
+        return;
+      }
       const data = await response.json();
       if (!response.ok) {
         throw new Error(data.error || "Failed to generate voice preview.");
@@ -240,9 +329,13 @@ export default function App() {
 
       const response = await fetch("/api/urdu/tts", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders(),
         body: JSON.stringify(payload),
       });
+      if (response.status === 401) {
+        await handleSignOut();
+        return;
+      }
 
       const data = await response.json();
       if (!response.ok) {
@@ -317,6 +410,26 @@ export default function App() {
     });
   };
 
+  if (authStatus === "checking") {
+    return (
+      <div className="min-h-screen flex items-center justify-center bg-[#F8F9FA] text-slate-600">
+        <div className="inline-flex items-center gap-2 text-sm font-medium">
+          <Loader2 className="w-4 h-4 animate-spin text-teal-700" />
+          Checking studio access...
+        </div>
+      </div>
+    );
+  }
+
+  if (authStatus === "locked") {
+    return (
+      <AccessGate
+        configured={accessConfigured}
+        onAuthenticated={handleAuthenticated}
+      />
+    );
+  }
+
   return (
     <div className="min-h-screen flex flex-col bg-[#F8F9FA] text-slate-900">
       {/* 3-Zone Top Bar Contract */}
@@ -339,6 +452,13 @@ export default function App() {
             <a href="#takes" className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0">
               Session Takes
             </a>
+            <button
+              type="button"
+              onClick={handleSignOut}
+              className="hover:text-slate-900 transition-colors whitespace-nowrap shrink-0"
+            >
+              Sign Out
+            </button>
           </nav>
 
           <div className="flex items-center shrink-0">
@@ -707,7 +827,17 @@ export default function App() {
       <footer className="border-t border-slate-200 bg-white mt-8">
         <div className="max-w-[1320px] mx-auto px-6 py-4 flex flex-col sm:flex-row items-center justify-between gap-2 text-xs text-slate-500">
           <span>SadaStudio — Urdu Voice-Over &amp; Script Synthesis</span>
-          <span>24 kHz 16-bit Mono WAV Export</span>
+          <div className="flex items-center gap-4">
+            <span>24 kHz 16-bit Mono WAV Export</span>
+            <button
+              type="button"
+              onClick={handleSignOut}
+              className="inline-flex items-center gap-1 text-slate-600 hover:text-slate-900 transition-colors whitespace-nowrap"
+            >
+              <LogOut className="w-3 h-3" />
+              Lock Studio
+            </button>
+          </div>
         </div>
       </footer>
     </div>
