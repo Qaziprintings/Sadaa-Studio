@@ -1,0 +1,6 @@
+{
+  "name": "SadaStudio — Urdu Voice-Over Studio",
+  "description": "Urdu AI voice-over studio powered by Gemini TTS and Urdu script preparation with selectable voices, delivery styles, dual-speaker dialogue, and WAV export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
